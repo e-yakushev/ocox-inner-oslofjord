@@ -1,0 +1,26 @@
+{
+  "example": {
+    "grid_file": "bathymetry_105to232.nc",
+    "forcing_file": "forcing_105to232.nc",
+    "atmospheric_forcing_dir": "JRA55",
+    "hotstart_file": "snapshots_ocean.nc"
+  },
+  "df-bgc": {
+    "grid_file": "bathymetry_19to67.nc",
+    "forcing_file": "forcing_drammen4.nc",
+    "atmospheric_forcing_dir": "JRA55",
+    "hotstart_file": "snapshots_ocean_df.nc"
+  },
+  "df-bgc-mp": {
+    "grid_file": "bathymetry_19to67.nc",
+    "forcing_file": "forcing_drammen6.nc",
+    "atmospheric_forcing_dir": "JRA55",
+    "hotstart_file": "snapshots_ocean_df.nc"
+  },
+  "df-bgc-mp2": {
+    "grid_file": "bathymetry_19to67.nc",
+    "forcing_file": "forcing_drammen_n2.nc",
+    "atmospheric_forcing_dir": "JRA55",
+    "hotstart_file": "snapshots_ocean_df.nc"
+  }
+}

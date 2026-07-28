@@ -1,0 +1,31 @@
+services:
+  fjordsim-oslofjord:
+    build: .
+    container_name: gcp-chem-sim-local
+
+    environment:
+      # Architecture: cpu or gpu (required by entrypoint.sh)
+      ARCH: "cpu"
+
+      # Scenario name (key in scenarios.json)
+      SCENARIO: "example"
+
+      # Simulation duration in days
+      STOP_DAYS: "1"
+
+      # Required by entrypoint.sh (dummy in local runs)
+      GCS_INPUT_PREFIX: "input"
+      GCS_OUTPUT_PREFIX: "output"
+
+      # Which Julia script to run (entrypoint.sh uses this)
+      SIMULATION_LAUNCHER: "/app/simulation.jl"
+
+      # Threads for Oceananigans / Julia
+      JULIA_NUM_THREADS: "1" # or "4" once things are stable
+
+    volumes:
+      - ./data/input:/app/data/input
+      - ./data/output:/app/data/output
+
+    stdin_open: true
+    tty: true

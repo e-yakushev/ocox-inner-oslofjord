@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import xarray as xr
@@ -27,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path.home() / "FjordSim_data" / "oslofjord",
+        default=Path.home() / "src" / "oslofjord-sim" / "data" / "input" / "oslofjord",
         help="Output directory for NetCDF files",
     )
     return parser.parse_args()
@@ -55,7 +56,19 @@ def process_month(year: int, month: int, output_dir: Path) -> None:
     dss = []
     mask = None
     for url in urls:
-        ds = xr.open_dataset(url)[PARAMETERS]
+        ds = None
+        for attempt in range(5):
+            try:
+                ds = xr.open_dataset(url)[PARAMETERS]
+                break
+            except OSError as e:
+                wait = 2 ** attempt
+                print(f"    ⚠ Attempt {attempt + 1} failed for {url}: {e}")
+                print(f"      Retrying in {wait}s...")
+                time.sleep(wait)
+        if ds is None:
+            print(f"    ✗ Skipping {url} after 5 failed attempts.")
+            continue
         if mask is None:
             mask = (
                 (ds.lat >= LATITUDE_RANGE[0]) & (ds.lat <= LATITUDE_RANGE[1]) &
