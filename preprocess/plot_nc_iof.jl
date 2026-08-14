@@ -17,14 +17,14 @@ import .plot_nc_stuff: prettydays, replace_zeros_with_NaN!, get_interior,
        compute_oxygen_saturation_fields, compute_bottom_index_from_O2,
        vert_transect_slice, make_bottom_depth_and_transect_figure,
        plot_tracer_subplot_map!, bottom_slices_at_day, oxygen_saturation,
-       record_horizontal_tracer, record_bottom_tracer,
+       record_horizontal_tracer, record_bottom_tracer, 
        get_365_days_indices, plot_six_animations_365_days,
        prepare_six_animations
 
 # ===================== MAIN CODE STARTS HERE =====================
 base_dir = dirname(@__DIR__)
-folder = joinpath(base_dir, "data", "output")
-filename = joinpath(folder, "snapshots_ocean")
+folder = joinpath(base_dir, "data", "output", "inner_oslofjord")
+filename = joinpath(folder, "snapshots_ocean_iof")
 
 # ===================== PLOTTING CONFIGURATION =====================
 # Map plotting parameters for each tracer (also used for bottom maps and animations)
@@ -187,11 +187,17 @@ end
 
 ##########################################
 # ------------------ Coordinates for plotting ------------------
+# Drammenfjord: lon 10.23–10.45, lat 59.585–59.755
+#oslo_fjord_lon_min = 10.23
+#oslo_fjord_lon_max = 10.45
+#oslo_fjord_lat_min = 59.585
+#oslo_fjord_lat_max = 59.755
 
-oslo_fjord_lon_min = 10.23
-oslo_fjord_lon_max = 10.45
-oslo_fjord_lat_min = 59.585
-oslo_fjord_lat_max = 59.755
+# Inner Oslofjord: lon 10.46, 10.79, lat 59.64, 59.92
+oslo_fjord_lon_min = 10.46
+oslo_fjord_lon_max = 10.79
+oslo_fjord_lat_min = 59.64
+oslo_fjord_lat_max = 59.92
 
 # Use actual data dimensions (may differ from grid coordinate variables due to staggering)
 data_Nx = size(T, 1)
@@ -245,8 +251,10 @@ make_bottom_depth_and_transect_figure(folder, bottom_z, depth, real_lon, real_la
 
 ##########################################
 # - Vertical-time plots of BGC variables -
-plot_ztime(NUT, O₂, O₂_sat, P, HET, T, DOM, POM, S, 16, 22, times, depth, folder)
-plot_ztime(NUT, O₂, O₂_sat, P, HET, T, DOM, POM, S, 10, 44, times, depth, folder)
+# Drammensfjord: 16, 22,; 10, 44 
+# Inner Oslofjord: 
+plot_ztime(NUT, O₂, O₂_sat, P, HET, T, DOM, POM, S, 20, 39, times, depth, folder)
+plot_ztime(NUT, O₂, O₂_sat, P, HET, T, DOM, POM, S, 9, 36, times, depth, folder)
 
 
 ##########################################
@@ -463,7 +471,6 @@ lines!(ax19, times_days, Int_Ci_free .+ Int_Ci_PHY .+ Int_Ci_HET,  linewidth = 2
 lines!(ax19, times_days, Int_Ci_free .+ Int_Ci_PHY .+ Int_Ci_HET .+ Int_Ci_POM,  linewidth = 2, color = :blue)
 lines!(ax19, times_days, Int_Ci_free .+ Int_Ci_PHY .+ Int_Ci_HET .+ Int_Ci_POM .+ Int_Ci_DOM,  linewidth = 2, color = :purple)
 
-
     CairoMakie.ylims!(ax11, 0, 0.4)
     CairoMakie.ylims!(ax12, 0, nothing)
     CairoMakie.ylims!(ax13, 0, nothing)
@@ -664,7 +671,7 @@ if maps_animations_
 # ------------------ Movies ------------------
     record_horizontal_tracer(S,   times, folder, "Ssurf",    PLOT[:S].label,
                             real_lon, real_lat;
-                            colorrange=(0, 35), colormap=PLOT[:S].colormap, iz=Nz, speed=animation_speed)
+                            colorrange=(0, 25), colormap=PLOT[:S].colormap, iz=Nz, speed=animation_speed)
     record_horizontal_tracer(NUT, times, folder, "NUTsurf",  PLOT[:NUT].label,
                             real_lon, real_lat;
                             colorrange=PLOT[:NUT].colorrange, colormap=PLOT[:NUT].colormap, iz=Nz, speed=animation_speed)

@@ -223,8 +223,8 @@ function compute_transect(bottom_z, Nz)
     transect = Vector{Tuple{Int,Int,Int,Int}}()
     num   = 1
     lier  = 0
-    drammen = 1
-    oslo  = 0
+    drammen = 0
+    oslo  = 1
 
     if drammen == 1
         println("Computing transect for Drammen fjord...")
@@ -258,9 +258,9 @@ function compute_transect(bottom_z, Nz)
 
     if oslo == 1
         println("Computing transect for Oslo fjord...")
-        for j in 1:71
-            max_depth_index = 12
-            for i in 27:-1:14
+        for j in 1:62 #71
+            max_depth_index = 16 #12
+            for i in 16:-1:1 #27:-1:14
                 if max_depth_index < bottom_z[i-1, j]
                     push!(transect, (num, i, j, max_depth_index))
                     num += 1
@@ -268,10 +268,20 @@ function compute_transect(bottom_z, Nz)
                 end
                 max_depth_index = bottom_z[i-1, j]
             end
+
+#            max_depth_index = 16 #12
+#            for i in 25:-1:14 #27:-1:14
+#                if max_depth_index < bottom_z[i-1, j]
+#                    push!(transect, (num, i, j, max_depth_index))
+#                    num += 1
+#                    break
+#                end
+#                max_depth_index = bottom_z[i-1, j]
+#            end            
         end
-        for j in 71:-1:34
-            max_depth_index = 12
-            for i in 27:44
+        for j in 62:-1:33 #71:-1:34
+            max_depth_index = 16
+            for i in 16:1:25 #27:44
                 if max_depth_index < bottom_z[i+1, j]
                     push!(transect, (num, i, j, max_depth_index))
                     num += 1
