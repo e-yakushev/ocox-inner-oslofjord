@@ -26,10 +26,14 @@ module OXYDEPModel
 
 export OXYDEP
 export bgh_oxydep_boundary_conditions
+export oxydep_sediment_forcings
 
 using Oceananigans: fields
 using Oceananigans.Units
 using Oceananigans.Fields: Field, TracerFields, CenterField, ZeroField
+using Oceananigans.Forcings: DiscreteForcing
+using Oceananigans.Operators: Δzᶜᶜᶜ
+using Oceananigans.Grids: bottommost_active_node, Center
 using Oceananigans.BoundaryConditions:
     fill_halo_regions!,
     ValueBoundaryCondition,
@@ -56,6 +60,9 @@ import Oceananigans.Biogeochemistry:
     update_biogeochemical_state!
 import OceanBioME: redfield, conserved_tracers
 import OceanBioME: maximum_sinking_velocity
+
+
+const Ci_ = false #Main.Ci_  # true: include Ci fields and calculations; false: skip them
 
 """ Surface PAR and turbulent vertical diffusivity based on idealised mixed layer depth """
 @inline PAR⁰(x, y, t) =
@@ -95,6 +102,11 @@ struct OXYDEP{FT,B,W} <: AbstractContinuousFormBiogeochemistry
     CtoN::FT # Redfield (106/16) to NO3, (uM(C)/uM(N)) 
     NtoN::FT # Richards denitrification (84.8/16.), (uM(N)/uM(N))
     NtoB::FT # N[uM]/BIOMASS [mg/m3], (uM(N) / mgWW/m3)
+    # Ci
+    r_ci_degrad::FT # Specific rate of Ci_ degradation, (1/d)
+    r_ci_free_phy::FT # Specific rate of Ci_free "uptake" by PHY i.e. biofouling, (1/d) 
+    r_ci_food_het::FT # Specific rate of Ci_PHY, Ci_free, Ci_POM uptake by HET, (1/d)
+    thr_ci_food_het::FT # Threshold of Ci_PHY, Ci_free, Ci_POM for HET uptake, (mmol/m3)
     optionals::B
     sinking_velocities::W
 end
@@ -105,12 +117,12 @@ function OXYDEP(grid;
     alphaI::FT = 1.8,   # [d-1/(W/m2)]
     betaI::FT = 5.2e-4, # [d-1/(W/m2)]
     gammaD::FT = 0.71,  # (-)
-    Max_uptake::FT = 1.7 / day,  # 1/d 2.0 4 5
-    Knut::FT = 1.5,            # (nd)
+    Max_uptake::FT = 1.85 / day,  # 1/d 2.0 4 5 1.4
+    Knut::FT = 0.8,            # (nd)
     r_phy_nut::FT = 0.10 / day, # 1/d
     r_phy_pom::FT = 0.15 / day, # 1/d
     r_phy_dom::FT = 0.17 / day, # 1/d
-    r_phy_het::FT = 0.5 / day,  # 1/d 0.4
+    r_phy_het::FT = 0.8 / day,  # 1/d 0.4
     Kphy::FT = 0.1,             # (nd) 0.7
     r_pom_het::FT = 0.7 / day,  # 1/d 0.7
     Kpom::FT = 2.0,     # (nd)
@@ -118,16 +130,21 @@ function OXYDEP(grid;
     Hz::FT = 0.5,       # (nd)
     r_het_nut::FT = 0.15 / day,      # 1/d 0.05
     r_het_pom::FT = 0.10 / day,      # 1/d 0.02
-    r_pom_nut_oxy::FT = 0.006 / day, # 1/d
-    r_pom_dom::FT = 0.05 / day,      # 1/d
+    r_pom_nut_oxy::FT = 0.05 / day,  # 1/d
+    r_pom_dom::FT = 0.10 / day,      # 1/d
     r_dom_nut_oxy::FT = 0.10 / day,  # 1/d
-    O2_suboxic::FT = 30.0,    # mmol/m3
+    O2_suboxic::FT = 20.0,           # mmol/m3
     r_pom_nut_nut::FT = 0.010 / day, # 1/d
     r_dom_nut_nut::FT = 0.003 / day, # 1/d
     OtoN::FT = 8.625, # (nd)
     CtoN::FT = 6.625, # (nd)
     NtoN::FT = 5.3,   # (nd)
     NtoB::FT = 0.016, # (nd)
+    r_ci_degrad::FT =  0.003 / day,  # Specific rate of Ci_ degradation, (1/d) 0.003 (Zhang et al., 2025)
+    r_ci_free_phy::FT = 100.0 / day, # Specific rate of Ci_free uptake by PHY, (1/d) 
+    r_ci_food_het::FT = 1.1 / day, # Specific rate of Ci_PHY, Ci_free, Ci_POM uptake by HET, (1/d)
+    thr_ci_food_het::FT = 0.001, # Threshold of Ci_PHY, Ci_free, Ci_POM for HET uptake, (mmol/m3)
+    #------ Optional parameters ------
     surface_photosynthetically_active_radiation = PAR⁰,
     light_attenuation_model::LA = TwoBandPhotosyntheticallyActiveRadiation(;
         grid,
@@ -136,7 +153,10 @@ function OXYDEP(grid;
     sediment_model::S = nothing,
     TS_forced::Bool = false,
     Chemicals::Bool = false,
-    sinking_speeds = (P = 0.15 / day, HET = 4.0 / day, POM = 10.0 / day),
+    sinking_speeds = Ci_ ?
+        (P = 1.0 / day, HET = 4.0 / day, POM = 9.0 / day,
+         Ci_PHY = 1.0 / day, Ci_HET = 4.0 / day, Ci_POM = 9.0 / day) :
+        (P = 1.0 / day, HET = 4.0 / day, POM = 9.0 / day),
     open_bottom::Bool = true,
     scale_negatives = true,
     particles::P = nothing,
@@ -175,6 +195,10 @@ function OXYDEP(grid;
         CtoN,
         NtoN,
         NtoB,
+        r_ci_degrad,
+        r_ci_free_phy,
+        r_ci_food_het,
+        thr_ci_food_het,
         optionals,
         sinking_velocities,
     )
@@ -193,20 +217,14 @@ function OXYDEP(grid;
     )
 end
 
+if Ci_
+    required_biogeochemical_tracers(::OXYDEP{<:Any,<:Val{(false, false)},<:Any}) =
+        (:NUT, :P, :HET, :POM, :DOM, :O₂, :T, :Ci_free, :Ci_PHY, :Ci_HET, :Ci_POM, :Ci_DOM)
+else
 required_biogeochemical_tracers(::OXYDEP{<:Any,<:Val{(false, false)},<:Any}) =
     (:NUT, :P, :HET, :POM, :DOM, :O₂, :T)
-required_biogeochemical_tracers(::OXYDEP{<:Any,<:Val{(false, true)},<:Any}) =
-    (:NUT, :P, :HET, :POM, :DOM, :O₂, :T, :Ci_free, :Ci_PHY, :Ci_HET, :Ci_POM, :Ci_DOM)
+end
 required_biogeochemical_auxiliary_fields(::OXYDEP{<:Any,<:Val{(false, false)},<:Any}) = (:PAR,)
-required_biogeochemical_auxiliary_fields(::OXYDEP{<:Any,<:Val{(false, true)},<:Any}) = (:PAR,)
-
-# colomney.jl
-required_biogeochemical_tracers(::OXYDEP{<:Any,<:Val{(true, false)},<:Any}) =
-        (:NUT, :P, :HET, :POM, :DOM, :O₂)
-required_biogeochemical_tracers(::OXYDEP{<:Any,<:Val{(true, true)},<:Any}) =    
-    (:NUT, :P, :HET, :POM, :DOM, :O₂, :Ci_free, :Ci_PHY, :Ci_HET, :Ci_POM, :Ci_DOM)
-required_biogeochemical_auxiliary_fields(::OXYDEP{<:Any,<:Val{(true, false)},<:Any}) = (:T, :PAR)
-required_biogeochemical_auxiliary_fields(::OXYDEP{<:Any,<:Val{(true, true)},<:Any}) = (:T, :PAR)
 
 @inline function biogeochemical_drift_velocity(bgc::OXYDEP, ::Val{tracer_name}) where {tracer_name}
     if tracer_name in keys(bgc.sinking_velocities)
@@ -247,31 +265,20 @@ adapt_structure(to, oxydep::OXYDEP) = OXYDEP(
     adapt(to, oxydep.CtoN),
     adapt(to, oxydep.NtoN),
     adapt(to, oxydep.NtoB),
+    adapt(to, oxydep.r_ci_degrad),
+    adapt(to, oxydep.r_ci_free_phy),
+    adapt(to, oxydep.r_ci_food_het),
+    adapt(to, oxydep.thr_ci_food_het),
     adapt(to, oxydep.optionals),
     adapt(to, oxydep.sinking_velocities),
 )
-summary(::OXYDEP{FT,Val{B},NamedTuple{K,V}}) where {FT,B,K,V} =
-    string("OXYDEP{$FT} with TS $(B[1] ? :✅ : :❌), Chemicals $(B[2] ? :✅ : :❌) and $K sinking")
 
-show(io::IO, model::OXYDEP{FT,Val{B},W}) where {FT,B,W} = print(
-    io,
-    string(
-        "Oxygen Depletion (OxyDep) model \n",
-        "├── Optional components:",
-        "\n",
-        "│   ├── TS $(B[1] ? :✅ : :❌) \n",
-        "│   ├── Chemicals $(B[2] ? :✅ : :❌) \n",
-        "└── Sinking Velocities:",
-        "\n",
-        show_sinking_velocities(model.sinking_velocities),
-    ),
-)
 
 """
 OxyDep basic biogeochemical transformations between NUT, P, HET, DOM, POM, O2
 """
 # Limiting equations and switches
-@inline yy(value, consta) = consta^2 / (value^2 + consta^2)   #This is a squared Michaelis-Menten type of limiter
+@inline yy(consta, value) = value^2 / (value^2 + consta^2)   #This is a squared Michaelis-Menten type of limiter
 @inline F_ox(conc, threshold) = (0.5 + 0.5 * tanh(conc - threshold))
 @inline F_subox(conc, threshold) = (0.5 - 0.5 * tanh(conc - threshold))
 
@@ -303,23 +310,76 @@ OxyDep basic biogeochemical transformations between NUT, P, HET, DOM, POM, O2
     (r_het_pom + F_subox(O₂, O2_suboxic) * 0.01 * r_het_pom) * HET
 
 # POM
-@inline POM_decay_ox(r_pom_nut_oxy, POM) = r_pom_nut_oxy * POM
+@inline POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) = 
+    O₂ < 0.1 ? zero(O₂) : r_pom_nut_oxy * POM * F_ox(O₂, O2_suboxic)
 @inline POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT) =
-    r_pom_nut_nut * POM * F_subox(O₂, O2_suboxic) * F_ox(NUT, 0.01)
+    NUT < 0.05 ? zero(NUT) : r_pom_nut_nut * POM * F_subox(O₂, O2_suboxic)
 #! depends on NUT (NO3+NO2) and DOM (NH4+Urea+"real"DON) ! depends on T ! stops at NUT<0.01 
 @inline Autolys(r_pom_dom, POM) = r_pom_dom * POM
 
 # DOM
-@inline DOM_decay_ox(r_dom_nut_oxy, DOM) = r_dom_nut_oxy * DOM
+@inline DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) = 
+    O₂ < 0.1 ? zero(O₂) : r_dom_nut_oxy * DOM * F_ox(O₂, O2_suboxic)
 @inline DOM_decay_denitr(r_dom_nut_nut, DOM, O₂, O2_suboxic, NUT) =
-    r_dom_nut_nut * DOM * F_subox(O₂, O2_suboxic) * F_ox(NUT, 0.01)
+    NUT < 0.05 ? zero(NUT) : r_dom_nut_nut * DOM * F_subox(O₂, O2_suboxic)
 #! depends on NUT (NO3+NO2) and DOM (NH4+Urea+"real"DON) ! depends on T ! stops at NUT<0.01 
 
 # O₂
 
+# Ci_
+if Ci_
+@inline Ci_phy_degrad(r_ci_degrad, Ci_PHY) = r_ci_degrad * Ci_PHY
+@inline Ci_het_degrad(r_ci_degrad, Ci_HET) = r_ci_degrad * Ci_HET
+@inline Ci_pom_degrad(r_ci_degrad, Ci_POM) = r_ci_degrad * Ci_POM
+@inline Ci_dom_degrad(r_ci_degrad, Ci_DOM) = r_ci_degrad * Ci_DOM
+@inline Ci_free_phy(r_ci_free_phy, Max_uptake, PAR, α, T, Knut, NUT, P, Iopt, Ci_free) = 
+    Ci_free < 1e-6 ? zero(Ci_free) :
+    r_ci_free_phy * GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt)
+@inline Ci_free_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_free, thr_ci_food_het) = 
+    r_ci_food_het * Uz * GrazPhy(r_phy_het, Kphy, P, HET) * yy(thr_ci_food_het, Ci_free)
+@inline Ci_phy_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_PHY, thr_ci_food_het) = 
+    r_ci_food_het * Uz * GrazPhy(r_phy_het, Kphy, P, HET) * yy(thr_ci_food_het, Ci_PHY)
+@inline Ci_pom_het(r_ci_food_het, Uz, r_pom_het, Kpom, POM, HET, Ci_POM, thr_ci_food_het) = 
+    r_ci_food_het * Uz * GrazPOM(r_pom_het, Kpom, POM, HET) * yy(thr_ci_food_het, Ci_POM)    
+@inline Ci_het_pom(r_het_pom, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+     Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, O₂, O2_suboxic, thr_ci_food_het) = 
+    HET < 1e-6 ? zero(HET) :
+    (Ci_free_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_free, thr_ci_food_het) +
+     Ci_phy_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_PHY, thr_ci_food_het) +
+     Ci_pom_het(r_ci_food_het, Uz, r_pom_het, Kpom, POM, HET, Ci_POM, thr_ci_food_het)) /
+     Uz * (1 - Uz) * (1 - Hz) +
+     Ci_HET * MortHet(r_het_pom, HET, O₂, O2_suboxic) / HET   
+
+@inline Ci_het_dom(r_het_nut, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+     Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, thr_ci_food_het) = 
+    HET < 1e-6 ? zero(HET) :
+    (Ci_free_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_free, thr_ci_food_het) +
+     Ci_phy_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_PHY, thr_ci_food_het) +
+     Ci_pom_het(r_ci_food_het, Uz, r_pom_het, Kpom, POM, HET, Ci_POM, thr_ci_food_het)) /
+     Uz * (1 - Uz) * Hz +
+     Ci_HET * RespHet(r_het_nut, HET) / HET
+
+@inline Ci_pom_dom( r_pom_nut_oxy, r_pom_nut_nut, r_pom_dom, O2_suboxic, NUT, POM, O₂, Ci_POM) = 
+     POM < 1e-6 ? zero(POM) :
+     Ci_POM * (POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) +
+     POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT) + 
+     Autolys(r_pom_dom, POM)) /POM
+@inline Ci_phy_dom(r_phy_dom, P, Ci_PHY) = 
+     P < 1e-6 ? zero(P) :
+     Ci_PHY * ExcrPhy(r_phy_dom, P) / P
+@inline Ci_phy_pom(r_phy_pom, P, Ci_PHY) = 
+     P < 1e-6 ? zero(P) :
+     Ci_PHY * MortPhy(r_phy_pom, P) / P
+end # if Ci_
 # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
 
-@inline function (bgc::OXYDEP)(::Val{:NUT}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+if Ci_
+
+@inline function (bgc::OXYDEP)(::Val{:NUT},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     Max_uptake = bgc.Max_uptake
     Knut = bgc.Knut
     α = bgc.initial_photosynthetic_slope
@@ -333,14 +393,12 @@ OxyDep basic biogeochemical transformations between NUT, P, HET, DOM, POM, O2
     r_dom_nut_nut = bgc.r_dom_nut_nut
     Iopt = bgc.Iopt
 
-    #println(GrowthPhy(Max_uptake,PAR,α,T,Knut,NUT,P,Iopt))
-    #wait_for_key("press any key to continue")
-
     return (
         RespPhy(r_phy_nut, P) +
         RespHet(r_het_nut, HET) +
-        DOM_decay_ox(r_dom_nut_oxy, DOM) +
-        POM_decay_ox(r_pom_nut_oxy, POM) - GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) -
+        DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) +
+        POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) - 
+        GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) -
         NtoN * (
             POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT) +
             DOM_decay_denitr(r_dom_nut_nut, DOM, O₂, O2_suboxic, NUT)
@@ -349,7 +407,11 @@ OxyDep basic biogeochemical transformations between NUT, P, HET, DOM, POM, O2
     # Denitrification of POM and DOM leads to decrease of NUT (i.e. NOx)
 end
 
-@inline function (bgc::OXYDEP)(::Val{:P}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+@inline function (bgc::OXYDEP)(::Val{:P},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     Max_uptake = bgc.Max_uptake
     Knut = bgc.Knut
     α = bgc.initial_photosynthetic_slope
@@ -367,7 +429,11 @@ end
     )
 end
 
-@inline function (bgc::OXYDEP)(::Val{:HET}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+@inline function (bgc::OXYDEP)(::Val{:HET},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     r_phy_het = bgc.r_phy_het
     Kphy = bgc.Kphy
     r_pom_het = bgc.r_pom_het
@@ -383,7 +449,11 @@ end
     )
 end
 
-@inline function (bgc::OXYDEP)(::Val{:POM}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+@inline function (bgc::OXYDEP)(::Val{:POM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     r_phy_het = bgc.r_phy_het
     Kphy = bgc.Kphy
     r_pom_het = bgc.r_pom_het
@@ -402,13 +472,18 @@ end
         (1.0 - Hz) *
         (GrazPhy(r_phy_het, Kphy, P, HET) + GrazPOM(r_pom_het, Kpom, POM, HET)) +
         MortPhy(r_phy_pom, P) +
-        MortHet(r_het_pom, HET, O₂, O2_suboxic) - POM_decay_ox(r_pom_nut_oxy, POM) -
+        MortHet(r_het_pom, HET, O₂, O2_suboxic) - 
+        POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) -
         Autolys(r_pom_dom, POM) - GrazPOM(r_pom_het, Kpom, POM, HET) -
         POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT)
     )
 end
 
-@inline function (bgc::OXYDEP)(::Val{:DOM}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+@inline function (bgc::OXYDEP)(::Val{:DOM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     r_phy_het = bgc.r_phy_het
     Kphy = bgc.Kphy
     r_pom_het = bgc.r_pom_het
@@ -425,14 +500,19 @@ end
         (1.0 - Uz) *
         Hz *
         (GrazPhy(r_phy_het, Kphy, P, HET) + GrazPOM(r_pom_het, Kpom, POM, HET)) +
-        ExcrPhy(r_phy_dom, P) - DOM_decay_ox(r_dom_nut_oxy, DOM) +
+        ExcrPhy(r_phy_dom, P) - 
+        DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic)  +
         Autolys(r_pom_dom, POM) +
         POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT)
     )
     # Denitrification of "real DOM" into NH4 (DOM_decay_denitr) will not change state variable DOM
 end
 
-@inline function (bgc::OXYDEP)(::Val{:O₂}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, PAR)
+@inline function (bgc::OXYDEP)(::Val{:O₂},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+
     Max_uptake = bgc.Max_uptake
     Knut = bgc.Knut
     α = bgc.initial_photosynthetic_slope
@@ -448,23 +528,58 @@ end
         -OtoN * (
             RespPhy(r_phy_nut, P) +
             RespHet(r_het_nut, HET) +
-            DOM_decay_ox(r_dom_nut_oxy, DOM) +
-            POM_decay_ox(r_pom_nut_oxy, POM) -
-            GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) # due to OM production and decay in normoxia
-            +
-            DOM_decay_ox(r_dom_nut_oxy, DOM) * (F_subox(O₂, O2_suboxic))
+            DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) +
+            POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) -
+            GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) + 
+            DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) * 
+            (F_subox(O₂, O2_suboxic))
         )
     )
     # (POM_decay_denitr + DOM_decay_denitr) & !denitrification doesn't change oxygen
-    # (DOM_decay_ox(r_dom_nut_oxy,DOM)*(F_subox) !additional consumption of O₂ due to oxidation of reduced froms of S,Mn,Fe etc.
+    # (DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) *(F_subox) !additional consumption of O₂ due to oxidation of reduced froms of S,Mn,Fe etc.
     # in suboxic conditions (F_subox) equals consumption for NH4 oxidation (Yakushev et al, 2008)
 
 end
 
-############################################################
+else # !Ci_
 
-"""
-@inline function (bgc::OXYDEP)(::Val{:Ch_free}, x, y, z, t, NUT, P, HET, POM, DOM, O₂, T, Ch_free, PAR)
+@inline function (bgc::OXYDEP)(::Val{:NUT},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
+    Max_uptake = bgc.Max_uptake
+    Knut = bgc.Knut
+    α = bgc.initial_photosynthetic_slope
+    r_phy_nut = bgc.r_phy_nut
+    r_het_nut = bgc.r_het_nut
+    r_pom_nut_oxy = bgc.r_pom_nut_oxy
+    r_dom_nut_oxy = bgc.r_dom_nut_oxy
+    NtoN = bgc.NtoN
+    r_pom_nut_nut = bgc.r_pom_nut_nut
+    O2_suboxic = bgc.O2_suboxic
+    r_dom_nut_nut = bgc.r_dom_nut_nut
+    Iopt = bgc.Iopt
+
+    return (
+        RespPhy(r_phy_nut, P) +
+        RespHet(r_het_nut, HET) +
+        DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) +
+        POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) - 
+        GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) -
+        NtoN * (
+            POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT) +
+            DOM_decay_denitr(r_dom_nut_nut, DOM, O₂, O2_suboxic, NUT)
+        )
+    )
+    # Denitrification of POM and DOM leads to decrease of NUT (i.e. NOx)
+end
+
+@inline function (bgc::OXYDEP)(::Val{:P},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
     Max_uptake = bgc.Max_uptake
     Knut = bgc.Knut
     α = bgc.initial_photosynthetic_slope
@@ -476,13 +591,270 @@ end
     Iopt = bgc.Iopt
 
     return (
-        0.1 * GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) -
+        GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) -
         GrazPhy(r_phy_het, Kphy, P, HET) - RespPhy(r_phy_nut, P) - MortPhy(r_phy_pom, P) -
         ExcrPhy(r_phy_dom, P)
     )
 end
-"""
 
+@inline function (bgc::OXYDEP)(::Val{:HET},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
+    r_phy_het = bgc.r_phy_het
+    Kphy = bgc.Kphy
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    r_het_nut = bgc.r_het_nut
+    r_het_pom = bgc.r_het_pom
+    Uz = bgc.Uz
+    O2_suboxic = bgc.O2_suboxic
+
+    return (
+        Uz * (GrazPhy(r_phy_het, Kphy, P, HET) + GrazPOM(r_pom_het, Kpom, POM, HET)) -
+        MortHet(r_het_pom, HET, O₂, O2_suboxic) - RespHet(r_het_nut, HET)
+    )
+end
+
+@inline function (bgc::OXYDEP)(::Val{:POM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
+    r_phy_het = bgc.r_phy_het
+    Kphy = bgc.Kphy
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    Uz = bgc.Uz
+    Hz = bgc.Hz
+    r_phy_pom = bgc.r_phy_pom
+    r_het_pom = bgc.r_het_pom
+    r_pom_nut_oxy = bgc.r_pom_nut_oxy
+    r_pom_dom = bgc.r_pom_dom
+    r_pom_nut_nut = bgc.r_pom_nut_nut
+    O2_suboxic = bgc.O2_suboxic
+
+    return (
+        (1.0 - Uz) *
+        (1.0 - Hz) *
+        (GrazPhy(r_phy_het, Kphy, P, HET) + GrazPOM(r_pom_het, Kpom, POM, HET)) +
+        MortPhy(r_phy_pom, P) +
+        MortHet(r_het_pom, HET, O₂, O2_suboxic) - 
+        POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) -
+        Autolys(r_pom_dom, POM) - GrazPOM(r_pom_het, Kpom, POM, HET) -
+        POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT)
+    )
+end
+
+@inline function (bgc::OXYDEP)(::Val{:DOM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
+    r_phy_het = bgc.r_phy_het
+    Kphy = bgc.Kphy
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    Uz = bgc.Uz
+    Hz = bgc.Hz
+    r_phy_dom = bgc.r_phy_dom
+    r_dom_nut_oxy = bgc.r_dom_nut_oxy
+    r_pom_dom = bgc.r_pom_dom
+    r_pom_nut_nut = bgc.r_pom_nut_nut
+    O2_suboxic = bgc.O2_suboxic
+
+    return (
+        (1.0 - Uz) *
+        Hz *
+        (GrazPhy(r_phy_het, Kphy, P, HET) + GrazPOM(r_pom_het, Kpom, POM, HET)) +
+        ExcrPhy(r_phy_dom, P) - 
+        DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) +
+        Autolys(r_pom_dom, POM) +
+        POM_decay_denitr(r_pom_nut_nut, POM, O₂, O2_suboxic, NUT)
+    )
+    # Denitrification of "real DOM" into NH4 (DOM_decay_denitr) will not change state variable DOM
+end
+
+@inline function (bgc::OXYDEP)(::Val{:O₂},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        PAR)
+
+    Max_uptake = bgc.Max_uptake
+    Knut = bgc.Knut
+    α = bgc.initial_photosynthetic_slope
+    r_phy_nut = bgc.r_phy_nut
+    r_het_nut = bgc.r_het_nut
+    r_pom_nut_oxy = bgc.r_pom_nut_oxy
+    r_dom_nut_oxy = bgc.r_dom_nut_oxy
+    OtoN = bgc.OtoN
+    O2_suboxic = bgc.O2_suboxic
+    Iopt = bgc.Iopt
+
+    return (
+        -OtoN * (
+            RespPhy(r_phy_nut, P) +
+            RespHet(r_het_nut, HET) +
+            DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) +
+            POM_decay_ox(r_pom_nut_oxy, POM, O₂, O2_suboxic) -
+            GrowthPhy(Max_uptake, PAR, α, T, Knut, NUT, P, Iopt) # due to OM production and decay in normoxia
+            +
+            DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) * F_subox(O₂, 0.5 * O2_suboxic)
+            )
+        )
+    # (POM_decay_denitr + DOM_decay_denitr) & !denitrification doesn't change oxygen
+    # (DOM_decay_ox(r_dom_nut_oxy, DOM, O₂, O2_suboxic) *(F_subox) !additional 
+    # consumption of O₂ due to oxidation of reduced froms of S,Mn,Fe etc.
+    # In suboxic conditions (F_subox) equals consumption for NH4 oxidation (Yakushev et al, 2008)
+
+end
+
+end # if Ci_ (tendency functions)
+
+####################################################################
+# Ci_(i) transformations
+####################################################################
+if Ci_
+
+@inline function (bgc::OXYDEP)(::Val{:Ci_free},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+    Max_uptake = bgc.Max_uptake
+    Knut = bgc.Knut
+    α = bgc.initial_photosynthetic_slope
+    Iopt = bgc.Iopt
+    r_ci_free_phy = bgc.r_ci_free_phy
+    r_ci_food_het = bgc.r_ci_food_het
+    r_phy_het = bgc.r_phy_het
+    Kphy = bgc.Kphy
+    Uz = bgc.Uz
+    thr_ci_food_het = bgc.thr_ci_food_het
+    return (
+        - Ci_free_phy(r_ci_free_phy, Max_uptake, PAR, α, T, Knut, NUT, P, Iopt, Ci_free)
+        - Ci_free_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_free, thr_ci_food_het)
+    )
+end
+
+@inline function (bgc::OXYDEP)(::Val{:Ci_PHY},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+    Max_uptake = bgc.Max_uptake
+    Knut = bgc.Knut
+    α = bgc.initial_photosynthetic_slope
+    Iopt = bgc.Iopt
+    r_ci_free_phy = bgc.r_ci_free_phy
+    r_phy_het = bgc.r_phy_het
+    Kphy = bgc.Kphy
+    Uz = bgc.Uz
+    r_ci_food_het = bgc.r_ci_food_het
+    r_phy_dom = bgc.r_phy_dom
+    r_phy_pom = bgc.r_phy_pom
+    thr_ci_food_het = bgc.thr_ci_food_het
+    r_ci_degrad = bgc.r_ci_degrad
+    return (
+          Ci_free_phy(r_ci_free_phy, Max_uptake, PAR, α, T, Knut, NUT, P, Iopt, Ci_free)
+        - Ci_phy_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_PHY, thr_ci_food_het)
+        - Ci_phy_pom(r_phy_pom, P, Ci_PHY) 
+        - Ci_phy_dom(r_phy_dom, P, Ci_PHY)     
+        - Ci_phy_degrad(r_ci_degrad, Ci_PHY)
+        )
+end
+
+@inline function (bgc::OXYDEP)(::Val{:Ci_HET},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+    r_phy_het = bgc.r_phy_het
+    Uz = bgc.Uz
+    Hz = bgc.Hz
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    r_ci_food_het = bgc.r_ci_food_het
+    thr_ci_food_het = bgc.thr_ci_food_het
+    r_het_pom = bgc.r_het_pom
+    r_phy_het = bgc.r_phy_het
+    O2_suboxic = bgc.O2_suboxic
+    Kphy = bgc.Kphy
+    Kpom = bgc.Kpom
+    r_het_nut = bgc.r_het_nut
+    r_ci_degrad = bgc.r_ci_degrad
+    return (
+          Ci_phy_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_PHY, thr_ci_food_het)
+        + Ci_free_het(r_ci_food_het, Uz, r_phy_het, Kphy, P, HET, Ci_free, thr_ci_food_het)
+        + Ci_pom_het(r_ci_food_het, Uz, r_pom_het, Kpom, POM, HET, Ci_POM, thr_ci_food_het)
+        - Ci_het_pom(r_het_pom, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+            Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, O₂, O2_suboxic, thr_ci_food_het) 
+        - Ci_het_dom(r_het_nut, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+             Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, thr_ci_food_het)            
+        - Ci_het_degrad(r_ci_degrad, Ci_HET)          
+    )
+end
+@inline function (bgc::OXYDEP)(::Val{:Ci_POM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+    r_ci_degrad = bgc.r_ci_degrad
+    Uz = bgc.Uz
+    Hz = bgc.Hz
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    r_ci_food_het = bgc.r_ci_food_het
+    thr_ci_food_het = bgc.thr_ci_food_het
+    r_het_pom = bgc.r_het_pom
+    r_phy_het = bgc.r_phy_het
+    r_pom_nut_oxy = bgc.r_pom_nut_oxy
+    r_pom_dom = bgc.r_pom_dom
+    r_pom_nut_nut = bgc.r_pom_nut_nut
+    r_phy_pom = bgc.r_phy_pom
+    O2_suboxic = bgc.O2_suboxic
+    Kphy = bgc.Kphy
+    Kpom = bgc.Kpom
+    return (
+          Ci_het_pom(r_het_pom, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+             Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, O₂, O2_suboxic, thr_ci_food_het) 
+        - Ci_pom_het(r_ci_food_het, Uz, r_pom_het, Kpom, POM, HET, Ci_POM, thr_ci_food_het)
+        - Ci_pom_dom( r_pom_nut_oxy, r_pom_nut_nut, r_pom_dom, O2_suboxic, 
+             NUT, POM, O₂, Ci_POM)      
+        + Ci_phy_pom(r_phy_pom, P, Ci_PHY)             
+        - Ci_pom_degrad(r_ci_degrad, Ci_POM)    
+    )
+end
+@inline function (bgc::OXYDEP)(::Val{:Ci_DOM},
+        x, y, z, t,
+        NUT, P, HET, POM, DOM, O₂, T,
+        Ci_free, Ci_PHY, Ci_HET, Ci_POM, Ci_DOM, PAR)
+    r_ci_degrad = bgc.r_ci_degrad
+    Uz = bgc.Uz
+    Hz = bgc.Hz
+    r_pom_het = bgc.r_pom_het
+    Kpom = bgc.Kpom
+    r_ci_food_het = bgc.r_ci_food_het
+    thr_ci_food_het = bgc.thr_ci_food_het
+    r_het_nut = bgc.r_het_nut
+    r_phy_het = bgc.r_phy_het
+    r_pom_nut_oxy = bgc.r_pom_nut_oxy
+    r_pom_dom = bgc.r_pom_dom
+    r_pom_nut_nut = bgc.r_pom_nut_nut
+    r_phy_dom = bgc.r_phy_dom
+    O2_suboxic = bgc.O2_suboxic
+    Kphy = bgc.Kphy
+    Kpom = bgc.Kpom
+    return (
+         Ci_het_dom(r_het_nut, r_phy_het, r_pom_het, r_ci_food_het, Uz, Hz, Kphy, Kpom, 
+             Ci_free, Ci_PHY, Ci_HET, Ci_POM, P, HET, POM, thr_ci_food_het)   
+        + Ci_pom_dom( r_pom_nut_oxy, r_pom_nut_nut, r_pom_dom, O2_suboxic, 
+             NUT, POM, O₂, Ci_POM)     
+        + Ci_phy_dom(r_phy_dom, P, Ci_PHY)                                    
+        - Ci_dom_degrad(r_ci_degrad, Ci_DOM)          
+    )
+end
+
+end # if Ci_
+
+############################################################################################
 # Coefficients from Garcia and Gordon (1992)
 const A1 = -173.4292
 const A2 = 249.6339
@@ -548,17 +920,141 @@ end
 @inline conserved_tracers(::OXYDEP) = (:NUT, :P, :HET, :POM, :DOM, :O₂)
 @inline sinking_tracers(bgc::OXYDEP) = keys(bgc.sinking_velocities)
 
-# OXYDEP constants
-const O2_suboxic = 10.0  # OXY threshold for oxic/suboxic switch (mmol/m3)
-const Trel = 5000000.0 # 250000.0 OK    #25000.0 #10000.0     # Relaxation time for exchange with the sediments (s/m)
-const b_ox = 15.0        # difference of OXY in the sediment and water, 
-const b_NUT = 10.0       # NUT in the sediment, (mmol/m3)  
-const b_DOM_ox = 6.0     # OM in the sediment (oxic conditions), (mmol/m3) 
-const b_DOM_anox = 10.0   # OM in the sediment (anoxic conditions), (mmol/m3)  
-const bu = 0.8  #0.85 0.6          # Burial coeficient for lower boundary (0<Bu<1), 1 - for no burying, (nd)
+""" OXYDEP constants for low boundary conditions and switches """
+const O2_suboxic = 20.0  # OXY threshold for oxic/suboxic switch (mmol/m3)
+const Trel = 86400. # Relaxation time for exchange 
+# with the sediments taking into account conversion from days to seconds (1/m)
+# positive for flux from water to the sediments:
+const b_O2_ox =       5.0 # flux of OXY at SWI, (mmol/m2/d) 
+const b_O2_subox =   16.0 # flux of OXY at SWI in subox, (mmol/m2/d) 
+const b_NUT_ox =     -1.0 # flux of NUT at SWI, (mmol/m2/d)
+const b_NUT_subox =   7.0 # flux of NUT at SWI in subox, (mmol/m2/d) 
+const b_DOM_ox =     -3.0 # flux of DOM at SWI, (mmol/m2/d) 
+const b_DOM_subox = -10.0 # flux of DOM at SWI in subox, (mmol/m2/d)   
+const bu = 0.001  #0.1 # Burial coeficient for lower boundary 
+# (0<Bu<1), 1 - for burying (removal from the water column), (nd)
 const windspeed = 5.0    # wind speed 10 m, (m/s)
 
-""" BGC boundary conditions """
+# --- Sediment forcing functions (applied at the actual seafloor) ---
+# These replace the old bottom BCs which only worked at k=1 (domain bottom).
+
+@inline function _is_seafloor(i, j, k, grid)
+    return bottommost_active_node(i, j, k, grid, Center(), Center(), Center())
+end
+
+@inline function _oxy_sediment(i, j, k, grid, clock, fields)
+    bottom = _is_seafloor(i, j, k, grid)
+    O₂ = @inbounds fields.O₂[i, j, k]
+    flux = O₂ ≤ 0 ? zero(O₂) : -(F_ox(O₂, O2_suboxic) * b_O2_ox +
+             F_subox(O₂, O2_suboxic) * b_O2_subox) / Trel
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(O₂))
+end
+
+@inline function _nut_sediment(i, j, k, grid, clock, fields)
+    bottom = _is_seafloor(i, j, k, grid)
+    O₂ = @inbounds fields.O₂[i, j, k]
+    NUT = @inbounds fields.NUT[i, j, k]
+    flux = NUT ≤ 0 ? zero(NUT) : -(F_ox(O₂, O2_suboxic) * b_NUT_ox +
+             F_subox(O₂, O2_suboxic) * b_NUT_subox) / Trel
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(O₂))
+end
+
+@inline function _dom_sediment(i, j, k, grid, clock, fields)
+    bottom = _is_seafloor(i, j, k, grid)
+    O₂ = @inbounds fields.O₂[i, j, k]
+    flux = -(F_ox(O₂, O2_suboxic) * b_DOM_ox +
+             F_subox(O₂, O2_suboxic) * b_DOM_subox) / Trel
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(O₂))
+end
+
+@inline function _P_burial(i, j, k, grid, clock, fields, w_P)
+    bottom = _is_seafloor(i, j, k, grid)
+    P = @inbounds fields.P[i, j, k]
+    w = @inbounds w_P[i, j, k]
+    flux = -bu * w * P
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(P))
+end
+
+@inline function _HET_burial(i, j, k, grid, clock, fields, w_HET)
+    bottom = _is_seafloor(i, j, k, grid)
+    HET = @inbounds fields.HET[i, j, k]
+    w = @inbounds w_HET[i, j, k]
+    flux = -bu * w * HET
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(HET))
+end
+
+@inline function _POM_burial(i, j, k, grid, clock, fields, w_POM)
+    bottom = _is_seafloor(i, j, k, grid)
+    POM = @inbounds fields.POM[i, j, k]
+    w = @inbounds w_POM[i, j, k]
+    flux = -bu * w * POM
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(POM))
+end
+
+if Ci_
+@inline function _Ci_PHY_burial(i, j, k, grid, clock, fields, w_Ci_PHY)
+    bottom = _is_seafloor(i, j, k, grid)
+    val = @inbounds fields.Ci_PHY[i, j, k]
+    w = @inbounds w_Ci_PHY[i, j, k]
+    flux = -bu * w * val
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(val))
+end
+
+@inline function _Ci_HET_burial(i, j, k, grid, clock, fields, w_Ci_HET)
+    bottom = _is_seafloor(i, j, k, grid)
+    val = @inbounds fields.Ci_HET[i, j, k]
+    w = @inbounds w_Ci_HET[i, j, k]
+    flux = -bu * w * val
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(val))
+end
+
+@inline function _Ci_POM_burial(i, j, k, grid, clock, fields, w_Ci_POM)
+    bottom = _is_seafloor(i, j, k, grid)
+    val = @inbounds fields.Ci_POM[i, j, k]
+    w = @inbounds w_Ci_POM[i, j, k]
+    flux = -bu * w * val
+    return ifelse(bottom, flux / Δzᶜᶜᶜ(i, j, k, grid), zero(val))
+end
+end # if Ci_
+
+"""
+    oxydep_sediment_forcings(biogeochemistry)
+
+Return a NamedTuple of DiscreteForcing objects that apply sediment-water interface
+fluxes at the actual seafloor (bottommost active cell). Use this instead of the
+bottom BCs in `bgh_oxydep_boundary_conditions` which only work when the seafloor
+coincides with k=1 of the domain.
+"""
+function oxydep_sediment_forcings(biogeochemistry)
+    bgc = biogeochemistry.underlying_biogeochemistry
+    w_P   = biogeochemical_drift_velocity(bgc, Val(:P)).w
+    w_HET = biogeochemical_drift_velocity(bgc, Val(:HET)).w
+    w_POM = biogeochemical_drift_velocity(bgc, Val(:POM)).w
+
+    base = (
+        O₂  = DiscreteForcing(_oxy_sediment),
+        NUT = DiscreteForcing(_nut_sediment),
+        DOM = DiscreteForcing(_dom_sediment),
+        P   = DiscreteForcing(_P_burial;   parameters=w_P),
+        HET = DiscreteForcing(_HET_burial; parameters=w_HET),
+        POM = DiscreteForcing(_POM_burial; parameters=w_POM),
+    )
+
+    if Ci_
+        w_Ci_PHY = biogeochemical_drift_velocity(bgc, Val(:Ci_PHY)).w
+        w_Ci_HET = biogeochemical_drift_velocity(bgc, Val(:Ci_HET)).w
+        w_Ci_POM = biogeochemical_drift_velocity(bgc, Val(:Ci_POM)).w
+        return merge(base, (
+            Ci_PHY = DiscreteForcing(_Ci_PHY_burial; parameters=w_Ci_PHY),
+            Ci_HET = DiscreteForcing(_Ci_HET_burial; parameters=w_Ci_HET),
+            Ci_POM = DiscreteForcing(_Ci_POM_burial; parameters=w_Ci_POM),
+        ))
+    else
+        return base
+    end
+end
+
+""" BGC boundary conditions (O₂ surface gas exchange only) """
 function bgh_oxydep_boundary_conditions(biogeochemistry, Nz)
 
     Oxy_top_cond(i, j, grid, clock, fields) = @inbounds (OxygenSeaWaterFlux(
@@ -570,52 +1066,9 @@ function bgh_oxydep_boundary_conditions(biogeochemistry, Nz)
     ))
 
     OXY_top = FluxBoundaryCondition(Oxy_top_cond; discrete_form = true)
+    oxy_bcs = FieldBoundaryConditions(top = OXY_top)
 
-    # oxic - suboxic switches
-    @inline F_ox(conc, threshold) = (0.5 + 0.5 * tanh(conc - threshold))
-    @inline F_subox(conc, threshold) = (0.5 - 0.5 * tanh(conc - threshold))
-
-    @inline OXY_bottom_cond(i, j, grid, clock, fields) = @inbounds -(
-        F_ox(fields.O₂[i, j, 1], O2_suboxic) * b_ox +
-        F_subox(fields.O₂[i, j, 1], O2_suboxic) * (fields.O₂[i, j, 1]- 0.0)
-    ) / Trel
-    OXY_bottom = FluxBoundaryCondition(OXY_bottom_cond, discrete_form = true)
-
-    @inline NUT_bottom_cond(i, j, grid, clock, fields) = @inbounds (
-        F_ox(fields.O₂[i, j, 1], O2_suboxic) * (b_NUT - fields.NUT[i, j, 1]) +
-        F_subox(fields.O₂[i, j, 1], O2_suboxic) * (0.0 - fields.NUT[i, j, 1])
-    ) / Trel
-    NUT_bottom = FluxBoundaryCondition(NUT_bottom_cond, discrete_form = true)
-
-    w_P(i, j) = biogeochemical_drift_velocity(biogeochemistry, Val(:P)).w[i, j, 1]
-    @inline P_bottom_cond(i, j, grid, clock, fields) = @inbounds -bu * w_P(i, j) * fields.P[i, j, 1]
-    P_bottom = FluxBoundaryCondition(P_bottom_cond, discrete_form = true)
-
-    w_HET(i, j) = biogeochemical_drift_velocity(biogeochemistry, Val(:HET)).w[i, j, 1]
-    @inline HET_bottom_cond(i, j, grid, clock, fields) = @inbounds -bu * w_HET(i, j) * fields.HET[i, j, 1]
-    HET_bottom = FluxBoundaryCondition(HET_bottom_cond, discrete_form = true)
-
-    w_POM(i, j) = biogeochemical_drift_velocity(biogeochemistry, Val(:POM)).w[i, j, 1]
-    @inline POM_bottom_cond(i, j, grid, clock, fields) = @inbounds -bu * w_POM(i, j) * fields.POM[i, j, 1]
-    POM_bottom = FluxBoundaryCondition(POM_bottom_cond, discrete_form = true)
-
-    DOM_top = ValueBoundaryCondition(0.0)
-    @inline DOM_bottom_cond(i, j, grid, clock, fields) = @inbounds (
-        F_ox(fields.O₂[i, j, 1], O2_suboxic) * (b_DOM_ox - fields.DOM[i, j, 1]) +
-        F_subox(fields.O₂[i, j, 1], O2_suboxic) * 2.0 * (b_DOM_anox - fields.DOM[i, j, 1])
-    ) / Trel
-    DOM_bottom = FluxBoundaryCondition(DOM_bottom_cond, discrete_form = true)
-
-    oxy_bcs = FieldBoundaryConditions(top = OXY_top, bottom = OXY_bottom)
-    nut_bcs = FieldBoundaryConditions(bottom = NUT_bottom)
-    dom_bcs = FieldBoundaryConditions(top = DOM_top, bottom = DOM_bottom)
-    pom_bcs = FieldBoundaryConditions(bottom = POM_bottom)
-    phy_bcs = FieldBoundaryConditions(bottom = P_bottom)
-    het_bcs = FieldBoundaryConditions(bottom = HET_bottom)
-
-    bc_oxydep = (O₂ = oxy_bcs, NUT = nut_bcs, DOM = dom_bcs, POM = pom_bcs, P = phy_bcs, HET = het_bcs)
-
-    return bc_oxydep
+    return (O₂ = oxy_bcs,)
 end
 
 end  # module
