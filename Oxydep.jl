@@ -130,11 +130,11 @@ function OXYDEP(grid;
     Hz::FT = 0.5,       # (nd)
     r_het_nut::FT = 0.15 / day,      # 1/d 0.05
     r_het_pom::FT = 0.10 / day,      # 1/d 0.02
-    r_pom_nut_oxy::FT = 0.05 / day,  # 1/d
+    r_pom_nut_oxy::FT = 0.02 / day,  # 1/d
     r_pom_dom::FT = 0.10 / day,      # 1/d
-    r_dom_nut_oxy::FT = 0.10 / day,  # 1/d
+    r_dom_nut_oxy::FT = 0.05 / day,  # 1/d
     O2_suboxic::FT = 20.0,           # mmol/m3
-    r_pom_nut_nut::FT = 0.010 / day, # 1/d
+    r_pom_nut_nut::FT = 0.005 / day, # 1/d
     r_dom_nut_nut::FT = 0.003 / day, # 1/d
     OtoN::FT = 8.625, # (nd)
     CtoN::FT = 6.625, # (nd)
@@ -926,11 +926,11 @@ const Trel = 86400. # Relaxation time for exchange
 # with the sediments taking into account conversion from days to seconds (1/m)
 # positive for flux from water to the sediments:
 const b_O2_ox =       5.0 # flux of OXY at SWI, (mmol/m2/d) 
-const b_O2_subox =   16.0 # flux of OXY at SWI in subox, (mmol/m2/d) 
+const b_O2_subox =   10.0 # flux of OXY at SWI in subox, (mmol/m2/d) 
 const b_NUT_ox =     -1.0 # flux of NUT at SWI, (mmol/m2/d)
 const b_NUT_subox =   7.0 # flux of NUT at SWI in subox, (mmol/m2/d) 
-const b_DOM_ox =     -3.0 # flux of DOM at SWI, (mmol/m2/d) 
-const b_DOM_subox = -10.0 # flux of DOM at SWI in subox, (mmol/m2/d)   
+const b_DOM_ox =     -4.0 # flux of DOM at SWI, (mmol/m2/d) 
+const b_DOM_subox = -12.0 # flux of DOM at SWI in subox, (mmol/m2/d)   
 const bu = 0.001  #0.1 # Burial coeficient for lower boundary 
 # (0<Bu<1), 1 - for burying (removal from the water column), (nd)
 const windspeed = 5.0    # wind speed 10 m, (m/s)
